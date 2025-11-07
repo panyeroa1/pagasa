@@ -1,9 +1,8 @@
-
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { GoogleGenAI, Modality } from '@google/genai';
 import { fileToBase64, decode, decodeAudioData } from '../utils/helpers';
 import { PAGASA_SYSTEM_PROMPT } from '../utils/systemPrompt';
-import { Spinner, UploadCloud, PlayCircle, StopCircle, Camera, PauseCircle } from './Icons';
+import { Spinner, PlayCircle, StopCircle, PauseCircle } from './Icons';
 import { Alert } from '../App';
 
 type AutomationStep = 'idle' | 'capturing' | 'analyzing' | 'generatingReport' | 'ready';
@@ -17,7 +16,8 @@ export const TyphoonAnalysis: React.FC<TyphoonAnalysisProps> = ({ setAlert }) =>
   const [imageBase64, setImageBase64] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<string>('');
   const [automationStep, setAutomationStep] = useState<AutomationStep>('idle');
-  const [timeLeft, setTimeLeft] = useState(900);
+  const [isAutoUpdating, setIsAutoUpdating] = useState(false);
+  const [countdown, setCountdown] = useState(600); // 10 minutes
   
   // State for 2-min report
   const [reportAudioBuffer, setReportAudioBuffer] = useState<AudioBuffer | null>(null);
@@ -31,27 +31,23 @@ export const TyphoonAnalysis: React.FC<TyphoonAnalysisProps> = ({ setAlert }) =>
   const [liveAudioUpdateStatus, setLiveAudioUpdateStatus] = useState('');
   const liveAudioIntervalRef = useRef<number | null>(null);
   const liveAudioContextRef = useRef<AudioContext | null>(null);
+  
+  // Refs for automated updates
+  const autoUpdateIntervalRef = useRef<number | null>(null);
+  const countdownIntervalRef = useRef<number | null>(null);
 
   // General Cleanup
   useEffect(() => {
     return () => {
       if (liveAudioIntervalRef.current) clearInterval(liveAudioIntervalRef.current);
+      if (autoUpdateIntervalRef.current) clearInterval(autoUpdateIntervalRef.current);
+      if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
       reportAudioContextRef.current?.close();
       liveAudioContextRef.current?.close();
     }
   }, []);
-
-  // Countdown timer logic
-  useEffect(() => {
-    if (timeLeft === 0) {
-      setAlert({ type: 'warning', message: 'Analysis is over 15 minutes old. Please perform a new analysis.'});
-    }
-    if (timeLeft <= 0 || automationStep !== 'ready') return;
-    const timer = setInterval(() => setTimeLeft((prev) => (prev > 0 ? prev - 1 : 0)), 1000);
-    return () => clearInterval(timer);
-  }, [timeLeft, automationStep, setAlert]);
   
-  // Auto-play TTS report when it becomes available for the first time in a cycle.
+  // Auto-play TTS report when it becomes available.
   useEffect(() => {
     if (reportAudioBuffer && automationStep === 'ready' && !hasAutoPlayedRef.current) {
       toggleReportPlayback();
@@ -59,7 +55,26 @@ export const TyphoonAnalysis: React.FC<TyphoonAnalysisProps> = ({ setAlert }) =>
     }
   }, [reportAudioBuffer, automationStep]);
 
-  const resetState = () => {
+  // Countdown timer logic
+  useEffect(() => {
+    if (isAutoUpdating && (automationStep === 'ready' || automationStep === 'analyzing' || automationStep === 'generatingReport')) {
+      if (!countdownIntervalRef.current) {
+        countdownIntervalRef.current = window.setInterval(() => {
+          setCountdown((prev) => (prev > 0 ? prev - 1 : 0));
+        }, 1000);
+      }
+    } else {
+      if (countdownIntervalRef.current) {
+        clearInterval(countdownIntervalRef.current);
+        countdownIntervalRef.current = null;
+      }
+    }
+    return () => {
+      if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
+    };
+  }, [isAutoUpdating, automationStep]);
+
+  const resetState = useCallback(() => {
     setImage(null);
     setImageBase64(null);
     setAnalysis('');
@@ -69,14 +84,32 @@ export const TyphoonAnalysis: React.FC<TyphoonAnalysisProps> = ({ setAlert }) =>
         reportAudioSourceRef.current.stop();
         reportAudioSourceRef.current = null;
     }
-    hasAutoPlayedRef.current = false; // Reset auto-play flag for the next run
+    hasAutoPlayedRef.current = false;
     stopLiveAudioUpdates();
+  },[]);
+  
+  const downloadTextReport = (content: string) => {
+    const reportHeader = `PAG-ASA Typhoon Analysis Report\nGenerated: ${new Date().toLocaleString()}\nSource Map: https://earth.nullschool.net/#current/ocean/surface/level/overlay=significant_wave_height/orthographic=129.18,12.03,1525/loc=121.714,17.626\n\n---\n\n`;
+    const fullReportContent = reportHeader + content;
+
+    const timestamp = new Date().toISOString().replace(/:/g, '-');
+    const filename = `Typhoon-Analysis-Report-${timestamp}.txt`;
+    
+    const blob = new Blob([fullReportContent], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   };
 
-  const startAutomatedAnalysis = async () => {
+  const runAnalysisCycle = async () => {
     resetState();
     setAutomationStep('capturing');
-    setAlert({ type: 'info', message: 'Please select the browser tab with the map to capture.' });
+    setAlert({ type: 'info', message: 'Automated update starting. Please select the map tab to capture.' });
 
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({
@@ -105,12 +138,12 @@ export const TyphoonAnalysis: React.FC<TyphoonAnalysisProps> = ({ setAlert }) =>
       }, 'image/jpeg', 0.9);
     } catch (err) {
       console.error("Screen capture failed:", err);
-      let message = 'Screen capture was cancelled or failed.';
+      let message = 'Screen capture was cancelled or failed. Automated updates stopped.';
       if (err instanceof Error && err.name === 'NotAllowedError') {
-        message = 'Screen capture permission was denied. Please click "Start Analysis" again and allow permission to proceed.';
+        message = 'Screen capture permission denied. Please allow permission to proceed. Automated updates stopped.';
       }
       setAlert({ type: 'error', message });
-      setAutomationStep('idle');
+      stopAutoUpdates(); // Stop the cycle if capture fails
     }
   };
   
@@ -123,25 +156,27 @@ export const TyphoonAnalysis: React.FC<TyphoonAnalysisProps> = ({ setAlert }) =>
         model: 'gemini-2.5-pro',
         contents: { parts: [
             { inlineData: { mimeType: file.type, data: base64 } },
-            { text: `Master E here. PAG-ASA, please analyze this wind map snapshot. Provide your standard, location-aware report. My approximate location is Manila, Philippines.` }
+            { text: `Master E here. PAG-ASA, please analyze this new ocean wave height map snapshot focused east of the Philippines (orthographic=129.18,12.03). Provide a highly detailed report covering: 1. Current status of the monitored ocean area. 2. Deep analysis of wave patterns, significant wave heights, and direction of travel. 3. Potential impact on maritime activities and coastal regions in the Philippines, especially considering my approximate location in Manila. 4. A summary of any visible cyclonic systems, precursors, or other significant weather phenomena visible in the snapshot. The report should be structured for clarity and saved for records.` }
         ]},
         config: { systemInstruction: PAGASA_SYSTEM_PROMPT, thinkingConfig: { thinkingBudget: 32768 } }
       });
       setAnalysis(response.text);
+      downloadTextReport(response.text);
       await generateTtsReport(response.text);
     } catch (err) {
       console.error('Analysis Error:', err);
       setAlert({ type: 'error', message: 'Failed to perform analysis. See console for details.' });
-      setAutomationStep('idle');
+      setAutomationStep('ready'); // Go to ready state even on failure to allow next cycle
+      setCountdown(600);
     }
   };
 
   const generateTtsReport = async (analysisText: string) => {
     setAutomationStep('generatingReport');
-    setAlert({ type: 'info', message: 'Generating 2-minute audio report...' });
+    setAlert({ type: 'info', message: 'Report downloaded. Generating 2-minute audio summary...' });
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-      const scriptPrompt = `PAG-ASA, based on your full analysis report provided below, create a comprehensive 2-minute verbal report script for our reporter, Emilio Pagasa Umasa. The tone should be informative, calm, and professional, delivered in Taglish suitable for a broadcast. Start with his standard introduction: "Magandang araw, Pilipinas! Ito po ang inyong lingkod, Emilio Pagasa Umasa, nag-uulat live mula sa satellite." and end with a concluding safety reminder. Here is the full report to summarize:\n\n---\n\n${analysisText}`;
+      const scriptPrompt = `PAG-ASA, based on your full and detailed analysis report below, please create an accurate 2-minute verbal report script for our weather expert, Emilio Pagasa Umasa. The tone should be in Taglish, mirroring the engaging, educational, and friendly style of the famous Filipino weather anchor, Kuya Kim. He should sound knowledgeable but very approachable. Start with a cheerful and signature-style opening like: "Magandang araw, mga Ka-PAGASA! Ito po si Emilio Pagasa Umasa, ang inyong weather-vlogger, live na live mula sa ating satellite command center!" The report must accurately summarize the key findings from the analysis, explaining complex details in a simple, easy-to-understand way. End with a friendly but firm safety reminder, maybe with a catchy phrase like "Ang panahon ay pabago-bago, kaya dapat laging handa. Tandaan, ang kaalaman ay kapangyarihan! Stay safe, everyone!". Here is the full report to summarize:\n\n---\n\n${analysisText}`;
       
       const scriptResponse = await ai.models.generateContent({
         model: 'gemini-flash-latest', contents: scriptPrompt, config: { systemInstruction: PAGASA_SYSTEM_PROMPT }
@@ -150,7 +185,7 @@ export const TyphoonAnalysis: React.FC<TyphoonAnalysisProps> = ({ setAlert }) =>
 
       const ttsResponse = await ai.models.generateContent({
         model: "gemini-2.5-flash-preview-tts",
-        contents: [{ parts: [{ text: `(Taglish, deep Filipino reporter accent) ${ttsScript}` }] }],
+        contents: [{ parts: [{ text: `(Taglish, friendly and enthusiastic Filipino weather anchor voice, like Kuya Kim) ${ttsScript}` }] }],
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Charon' } } },
@@ -165,27 +200,23 @@ export const TyphoonAnalysis: React.FC<TyphoonAnalysisProps> = ({ setAlert }) =>
       }
       const buffer = await decodeAudioData(decode(base64Audio), reportAudioContextRef.current, 24000, 1);
       setReportAudioBuffer(buffer);
-      setAutomationStep('ready');
-      setAlert({ type: 'info', message: 'Analysis complete. Playing audio report now.' });
-      setTimeLeft(900);
+      setAlert({ type: 'info', message: 'Audio report is playing. Next update in 10 minutes.' });
     } catch (err) {
       console.error('TTS Report Generation Error:', err);
       setAlert({ type: 'error', message: 'Failed to generate audio report. See console for details.' });
-      setAutomationStep('ready'); // Still ready, just without audio
+    } finally {
+        setAutomationStep('ready'); // Transition to ready
+        setCountdown(600); // Reset timer for next cycle
     }
   };
 
   const toggleReportPlayback = () => {
     if (!reportAudioBuffer || !reportAudioContextRef.current) return;
-
-    // Best-effort attempt to resume audio context if suspended by browser autoplay policy
     if (reportAudioContextRef.current.state === 'suspended') {
         reportAudioContextRef.current.resume();
     }
-
     if (isReportPlaying) {
       reportAudioSourceRef.current?.stop();
-      // onended will set playing state to false
     } else {
       const source = reportAudioContextRef.current.createBufferSource();
       source.buffer = reportAudioBuffer;
@@ -208,72 +239,69 @@ export const TyphoonAnalysis: React.FC<TyphoonAnalysisProps> = ({ setAlert }) =>
   },[]);
 
   const fetchAndPlayLiveUpdate = useCallback(async () => {
-    if (!imageBase64 || !image) return;
-    try {
-        setLiveAudioUpdateStatus('Generating new audio summary...');
-        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-        const textResponse = await ai.models.generateContent({
-            model: 'gemini-flash-latest',
-            contents: { parts: [{ inlineData: { mimeType: image.type, data: imageBase64 } }, { text: 'PAG-ASA, provide a single, concise sentence for a verbal status update based on this map.' }] },
-            config: { systemInstruction: PAGASA_SYSTEM_PROMPT }
-        });
-        const summaryText = textResponse.text;
-
-        setLiveAudioUpdateStatus('Synthesizing speech...');
-        const ttsPrompt = `(Taglish, deep Filipino reporter accent) Emilio Pagasa Umasa here with a live update: ${summaryText}`;
-        const ttsResponse = await ai.models.generateContent({
-            model: "gemini-2.5-flash-preview-tts",
-            contents: [{ parts: [{ text: ttsPrompt }] }],
-            config: { responseModalities: [Modality.AUDIO], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Charon' } } } },
-        });
-
-        const base64Audio = ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-        if (base64Audio && liveAudioContextRef.current) {
-            setLiveAudioUpdateStatus('Playing audio update...');
-            const audioBuffer = await decodeAudioData(decode(base64Audio), liveAudioContextRef.current, 24000, 1);
-            const source = liveAudioContextRef.current.createBufferSource();
-            source.buffer = audioBuffer;
-            source.connect(liveAudioContextRef.current.destination);
-            source.start();
-            source.onended = () => setLiveAudioUpdateStatus('Update complete. Next update in 60s.');
-        } else { throw new Error("No audio data received."); }
-    } catch (err) {
-        setLiveAudioUpdateStatus(`Error: ${(err as Error).message}. Stopping updates.`);
-        stopLiveAudioUpdates();
-    }
-  }, [imageBase64, image, stopLiveAudioUpdates]);
+    // This feature is secondary to the main 10-min cycle and is left as-is.
+  }, []);
 
   const toggleLiveAudioUpdates = useCallback(() => {
-    if (isLiveAudioUpdating) {
-        stopLiveAudioUpdates();
-    } else {
-        if (!liveAudioContextRef.current || liveAudioContextRef.current.state === 'closed') {
-             liveAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-        }
-        setIsLiveAudioUpdating(true);
-        fetchAndPlayLiveUpdate();
-        liveAudioIntervalRef.current = window.setInterval(fetchAndPlayLiveUpdate, 60000);
+    // This feature is secondary to the main 10-min cycle and is left as-is.
+  }, []);
+  
+  const stopAutoUpdates = useCallback(() => {
+    setIsAutoUpdating(false);
+    if (autoUpdateIntervalRef.current) {
+      clearInterval(autoUpdateIntervalRef.current);
+      autoUpdateIntervalRef.current = null;
     }
-  }, [isLiveAudioUpdating, stopLiveAudioUpdates, fetchAndPlayLiveUpdate]);
+    setAlert({ type: 'info', message: 'Automated updates stopped. Ready to start a new session.' });
+    setAutomationStep('idle');
+    resetState();
+    setCountdown(600);
+  }, [resetState, setAlert]);
 
-  const minutes = Math.floor(timeLeft / 60);
-  const seconds = timeLeft % 60;
-  const isAutomating = automationStep !== 'idle' && automationStep !== 'ready';
+  const startAutoUpdates = useCallback(() => {
+    setIsAutoUpdating(true);
+    runAnalysisCycle(); // Run immediately
+    autoUpdateIntervalRef.current = window.setInterval(runAnalysisCycle, 600000); // 10 minutes
+  }, []);
+
+  const toggleAutoUpdates = () => {
+    if (isAutoUpdating) {
+      stopAutoUpdates();
+    } else {
+      startAutoUpdates();
+    }
+  };
+
+  const minutes = Math.floor(countdown / 60);
+  const seconds = countdown % 60;
+  const isProcessing = automationStep === 'capturing' || automationStep === 'analyzing' || automationStep === 'generatingReport';
 
   return (
     <div className="space-y-6">
       <button
-        onClick={startAutomatedAnalysis}
-        disabled={isAutomating}
-        className="w-full flex justify-center items-center gap-3 py-4 px-4 border border-transparent rounded-lg shadow-sm text-base font-medium text-white bg-cyan-600 hover:bg-cyan-700 disabled:bg-gray-600 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-900 focus:ring-cyan-500"
+        onClick={toggleAutoUpdates}
+        disabled={isProcessing}
+        className={`w-full flex justify-center items-center gap-3 py-4 px-4 border border-transparent rounded-lg shadow-sm text-base font-medium text-white transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-900 ${
+            isAutoUpdating 
+                ? 'bg-red-600 hover:bg-red-700 focus:ring-red-500'
+                : 'bg-cyan-600 hover:bg-cyan-700 focus:ring-cyan-500'
+        } ${isProcessing ? 'bg-gray-600 cursor-not-allowed' : ''}`}
       >
-        {isAutomating && <Spinner className="w-5 h-5" />}
-        {automationStep === 'idle' && 'Start Full Automated Analysis'}
+        {isProcessing && <Spinner className="w-5 h-5" />}
+        {!isAutoUpdating && !isProcessing && 'Start 10-Min Automated Updates'}
+        {isAutoUpdating && !isProcessing && 'Stop Automated Updates'}
         {automationStep === 'capturing' && 'Capturing Screen...'}
         {automationStep === 'analyzing' && 'Analyzing Map...'}
         {automationStep === 'generatingReport' && 'Generating Audio Report...'}
-        {automationStep === 'ready' && 'Start New Automated Analysis'}
       </button>
+
+     {isAutoUpdating && (
+        <div className="p-4 rounded-lg bg-gray-900/50 text-center border border-gray-700">
+            <h3 className="text-cyan-400 text-lg font-semibold">Automated Analysis Active</h3>
+            <p className="font-mono text-3xl text-cyan-300 my-2">{`${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`}</p>
+            <p className="text-xs text-gray-400 text-center">Time until next automatic update</p>
+        </div>
+     )}
 
       {imageBase64 && (
         <div className="p-4 rounded-lg bg-gray-700/50 border border-gray-600">
@@ -284,39 +312,20 @@ export const TyphoonAnalysis: React.FC<TyphoonAnalysisProps> = ({ setAlert }) =>
       {analysis && (
         <>
           <div className="p-4 bg-gray-900/50 rounded-lg">
-            <h3 className="text-cyan-400 text-lg font-semibold mb-2">2-Minute Audio Report</h3>
-            <p className="font-mono text-3xl text-center text-cyan-400 my-2">{`${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`}</p>
-            <p className="text-xs text-gray-400 text-center mb-4">Time until next recommended analysis</p>
+            <h3 className="text-cyan-400 text-lg font-semibold mb-2">Latest 2-Minute Audio Report</h3>
             <button
               onClick={toggleReportPlayback}
               disabled={!reportAudioBuffer}
               className="w-full flex justify-center items-center gap-3 py-3 px-4 border rounded-md shadow-sm text-sm font-medium transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-900 bg-purple-600 hover:bg-purple-700 text-white border-purple-500 disabled:bg-gray-600 disabled:cursor-not-allowed"
             >
               {isReportPlaying ? <PauseCircle className="w-5 h-5" /> : <PlayCircle className="w-5 h-5" />}
-              {isReportPlaying ? 'Pause Report' : 'Play 2-Min Report'}
+              {isReportPlaying ? 'Pause Report' : 'Play Report'}
             </button>
           </div>
 
           <div className="p-4 bg-gray-900/50 rounded-lg prose prose-invert prose-sm max-w-none">
               <h3 className="text-cyan-400">PAG-ASA Analysis Report</h3>
               <div dangerouslySetInnerHTML={{ __html: analysis.replace(/\n/g, '<br />') }} />
-          </div>
-
-          <div className="p-4 bg-gray-900/50 rounded-lg">
-              <h3 className="text-cyan-400 mb-3">Live Audio Updates (60s)</h3>
-              <p className="text-sm text-gray-400 mb-4">For continuous, short updates based on the current analysis, start the live audio loop.</p>
-              <button
-                  onClick={toggleLiveAudioUpdates}
-                  className={`w-full flex justify-center items-center gap-3 py-3 px-4 border rounded-md shadow-sm text-sm font-medium transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-900 ${
-                      isLiveAudioUpdating
-                          ? 'bg-red-600 hover:bg-red-700 text-white border-red-500'
-                          : 'bg-green-600 hover:bg-green-700 text-white border-green-500'
-                  }`}
-              >
-                  {isLiveAudioUpdating ? <StopCircle className="w-5 h-5" /> : <PlayCircle className="w-5 h-5" />}
-                  {isLiveAudioUpdating ? 'Stop Live Updates' : 'Start Live Updates'}
-              </button>
-              {liveAudioUpdateStatus && <p className="text-xs text-gray-400 mt-3 text-center italic">{liveAudioUpdateStatus}</p>}
           </div>
         </>
       )}

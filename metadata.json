@@ -1,0 +1,9 @@
+{
+  "name": "Analysis Center",
+  "description": "An advanced application that provides real-time typhoon tracking via an embedded map, deep analysis using various Gemini models, and interactive conversational AI capabilities. Users can upload map screenshots for deep analysis, ask questions via voice or text with grounded, up-to-date information, and get low-latency responses.",
+  "requestFramePermissions": [
+    "microphone",
+    "geolocation",
+    "display-capture"
+  ]
+}
